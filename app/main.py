@@ -5,7 +5,7 @@ import os
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from sqlite3 import Connection
 
 from . import database, schemas, services
@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="胶片档案扫描整理 API",
     description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比。",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -103,6 +103,39 @@ def get_roll(roll_no: str, conn: Connection = Depends(database.get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
     return result
+
+
+@app.get(
+    "/rolls/{roll_no}/frame-provenance",
+    response_model=schemas.FrameProvenanceOut,
+    tags=["胶卷"],
+)
+def get_frame_provenance(
+    roll_no: str,
+    start: int = Query(..., ge=0, description="帧号闭区间起始（含），非负整数"),
+    end: int = Query(..., ge=0, description="帧号闭区间结束（含），非负整数，end >= start"),
+    limit: int = Query(..., ge=1, description="每页最多返回的帧数（正整数）"),
+    cursor: int | None = Query(
+        None, ge=0, description="分页游标：上一页末帧号；续页只取更大帧号"
+    ),
+    conn: Connection = Depends(database.get_db),
+):
+    """追查某段帧号各自由哪些批次扫描（帧溯源）。
+
+    只按 [start, end] 内**实际存在**的帧号升序分页（不逐帧遍历跨度），
+    `cursor` 为上一页末帧号。每帧返回当前首扫归属批次、按原导入顺序排列的
+    参与批次及各批原始列表中的出现次数（旧批次无原始列表时为 null），
+    并标明是否位于当前预期覆盖内。撤销批次后依据剩余批次实时重算。
+    end < start 返回 422；胶卷不存在返回 404。
+    """
+    try:
+        return services.get_frame_provenance(
+            conn, roll_no.strip(), start, end, limit, cursor
+        )
+    except services.FrameProvenanceValidationError:
+        raise HTTPException(status_code=422, detail="end 不能小于 start")
+    except services.RollNotFoundError:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
 
 
 @app.post(

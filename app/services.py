@@ -242,6 +242,129 @@ def list_rolls(conn: sqlite3.Connection) -> list[schemas.RollSummary]:
     return out
 
 
+class FrameProvenanceValidationError(Exception):
+    """帧溯源区间参数无效（end < start），接口返回 422。"""
+
+
+def get_frame_provenance(
+    conn: sqlite3.Connection,
+    roll_no: str,
+    start: int,
+    end: int,
+    limit: int,
+    cursor: int | None,
+) -> schemas.FrameProvenanceOut:
+    """分页追查闭区间 [start, end] 内实际存在的帧各自由哪些批次扫描。
+
+    只枚举 roll_frames 中实际存在的帧（WHERE frame_no BETWEEN … 走主键索引，
+    不在帧号轴上逐帧展开跨度），严格大于 cursor 起按帧号升序取 limit+1 条判定
+    是否还有下一页，游标即上一页末帧号。
+
+    每帧给出：
+    - first_batch_id：roll_frames.batch_id 即当前首扫归属；撤销批次后该表按剩余
+      批次原导入顺序整体重建，归属随之实时转移；
+    - batches：现存扫到该帧的全部批次，按原导入顺序（created_at, rowid）排列，
+      occurrence_count 为该帧在该批**原始帧列表**中的出现次数；旧批次没有原始
+      列表（raw_frames_json 为 NULL）时返回 null，不据去重集合推断；
+    - in_expected_coverage：是否位于当前合并后的预期覆盖闭区间内。
+
+    胶卷不存在（尚未导入任何批次）抛 RollNotFoundError（404）。
+    """
+    if end < start:
+        raise FrameProvenanceValidationError()
+
+    if not _roll_exists(conn, roll_no):
+        raise RollNotFoundError(roll_no)
+
+    expected = _expected_ranges(conn, roll_no)
+
+    # 多取 1 条用于判定是否还有下一页，避免为总数再扫一遍区间
+    lower = start if cursor is None else max(start, cursor + 1)
+    rows = conn.execute(
+        """SELECT frame_no, batch_id
+             FROM roll_frames
+            WHERE roll_no = ? AND frame_no BETWEEN ? AND ?
+              AND (? IS NULL OR frame_no > ?)
+            ORDER BY frame_no
+            LIMIT ?""",
+        (roll_no, lower, end, cursor, cursor, limit + 1),
+    ).fetchall()
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = page[-1]["frame_no"] if has_more and page else None
+
+    if not page:
+        return schemas.FrameProvenanceOut(
+            roll_no=roll_no,
+            start=start,
+            end=end,
+            limit=limit,
+            next_cursor=None,
+            frames=[],
+        )
+
+    page_frames = [r["frame_no"] for r in page]
+    owner_by_frame = {r["frame_no"]: r["batch_id"] for r in page}
+
+    # 现存批次按原导入顺序；撤销的批次已不在此表，天然不参与溯源
+    batch_rows = conn.execute(
+        """SELECT id, frames_json, raw_frames_json
+             FROM batches
+            WHERE roll_no = ?
+            ORDER BY created_at, rowid""",
+        (roll_no,),
+    ).fetchall()
+
+    wanted = set(page_frames)
+    member_by_batch: dict[str, set[int]] = {}
+    counts_by_batch: dict[str, dict[int, int]] = {}
+    for br in batch_rows:
+        raw = br["raw_frames_json"]
+        if raw is None:
+            # 旧批次只有去重帧集合：只判定是否参与，出现次数留 null
+            member_by_batch[br["id"]] = set(json.loads(br["frames_json"])) & wanted
+            counts_by_batch[br["id"]] = {}
+        else:
+            raw_frames = json.loads(raw)
+            counts: dict[int, int] = {}
+            members: set[int] = set()
+            for f in raw_frames:
+                if f in wanted:
+                    members.add(f)
+                    counts[f] = counts.get(f, 0) + 1
+            member_by_batch[br["id"]] = members
+            counts_by_batch[br["id"]] = counts
+
+    frames_out: list[schemas.FrameProvenance] = []
+    for f in page_frames:
+        participants = [
+            schemas.FrameProvenanceBatch(
+                batch_id=br["id"],
+                occurrence_count=counts_by_batch[br["id"]].get(f),
+            )
+            for br in batch_rows
+            if f in member_by_batch[br["id"]]
+        ]
+        frames_out.append(
+            schemas.FrameProvenance(
+                frame_no=f,
+                first_batch_id=owner_by_frame[f],
+                in_expected_coverage=any(s <= f <= e for s, e in expected),
+                batches=participants,
+            )
+        )
+
+    return schemas.FrameProvenanceOut(
+        roll_no=roll_no,
+        start=start,
+        end=end,
+        limit=limit,
+        next_cursor=next_cursor,
+        frames=frames_out,
+    )
+
+
 def get_batch(conn: sqlite3.Connection, batch_id: str) -> schemas.BatchResult | None:
     r = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
     if r is None:
