@@ -955,3 +955,114 @@ def get_snapshot_diff(
         frames=_range_diff(cur_frames, snap_frames),
         missing=_range_diff(cur_missing, snap_missing),
     )
+
+
+# ---------- 帧号扫描溯源 ----------
+
+class ProvenanceRangeError(Exception):
+    """溯源查询区间非法：end < start。"""
+
+
+def frame_provenance(
+    conn: sqlite3.Connection,
+    roll_no: str,
+    start: int,
+    end: int,
+    limit: int,
+    cursor: int | None,
+) -> schemas.FrameProvenanceOut:
+    """按帧号升序分页追溯实际存在的帧由哪些有效批次扫描。
+
+    - 只遍历真实存在的帧（roll_frames 主键索引 + frame_no 键集分页），
+      不逐帧展开 [start, end] 的跨度，故区间跨度巨大时成本只与命中帧数、
+      limit 及该胶卷批次数相关；
+    - 续页以 frame_no > cursor 取下界，cursor 即上一页末帧号；cursor 落后于
+      start 时下界回退为 start（start 帧不会被跳过），cursor 超出 end 时
+      返回空页而非逐帧遍历；
+    - 每帧给出当前归属（最早有效批次）、参与批次（按批次原导入顺序）及
+      各批原始列表中的出现次数（旧批次无原始列表时为 null，不推断）；
+    - 撤销批次后 roll_frames 与各批原始列表均已重建，本函数实时计算，
+      故首扫归属会随撤销转移；
+    - end < start 抛 ProvenanceRangeError（接口返回 422）；
+      胶卷不存在（无任何批次）抛 RollNotFoundError（接口返回 404）。
+    """
+    if end < start:
+        raise ProvenanceRangeError()
+    # frame_no > lower：无游标时下界为 start-1（含 start）；
+    # 游标落后于 start 时同样从 start 起，不跳过 start 帧
+    lower = start - 1 if cursor is None else max(cursor, start - 1)
+
+    # 只读事务中一致性读取帧集合、帧归属、批次原始列表与预期范围
+    conn.execute("BEGIN")
+    try:
+        if not _roll_exists(conn, roll_no):
+            raise RollNotFoundError(roll_no)
+
+        # 键集分页：取 limit+1 判定是否有下一页；仅扫描实际存在的帧
+        frame_rows = conn.execute(
+            """SELECT frame_no, batch_id
+                 FROM roll_frames
+                WHERE roll_no = ? AND frame_no > ? AND frame_no <= ?
+                ORDER BY frame_no
+                LIMIT ?""",
+            (roll_no, lower, end, limit + 1),
+        ).fetchall()
+
+        batch_rows = conn.execute(
+            """SELECT id, raw_frames_json, frames_json
+                 FROM batches
+                WHERE roll_no = ?
+                ORDER BY created_at, rowid""",
+            (roll_no,),
+        ).fetchall()
+
+        expected = _expected_ranges(conn, roll_no)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    owner_of: dict[int, str] = {r["frame_no"]: r["batch_id"] for r in frame_rows}
+    page_frames = sorted(owner_of)
+    has_more = len(page_frames) > limit
+    if has_more:
+        page_frames = page_frames[:limit]
+
+    # 每帧 -> 参与批次（按批次原导入顺序）；旧批次只知去重集合，计数为 None
+    participation: dict[int, list[schemas.FrameBatchRef]] = {}
+    wanted = set(page_frames)
+    for br in batch_rows:
+        raw_json = br["raw_frames_json"]
+        if raw_json is not None:
+            counts: dict[int, int] = {}
+            for f in json.loads(raw_json):
+                counts[f] = counts.get(f, 0) + 1
+        else:
+            counts = None
+        batch_frames = (
+            set(counts) if counts is not None else set(json.loads(br["frames_json"]))
+        )
+        for f in wanted & batch_frames:
+            occurrence = counts.get(f) if counts is not None else None
+            participation.setdefault(f, []).append(
+                schemas.FrameBatchRef(
+                    batch_id=br["id"], occurrence_count=occurrence
+                )
+            )
+
+    items: list[schemas.FrameProvenanceItem] = []
+    for f in page_frames:
+        items.append(
+            schemas.FrameProvenanceItem(
+                frame_no=f,
+                first_scan_batch_id=owner_of[f],
+                in_expected_coverage=any(s <= f <= e for s, e in expected),
+                batches=participation.get(f, []),
+            )
+        )
+
+    return schemas.FrameProvenanceOut(
+        roll_no=roll_no,
+        frames=items,
+        next_cursor=page_frames[-1] if has_more and page_frames else None,
+    )

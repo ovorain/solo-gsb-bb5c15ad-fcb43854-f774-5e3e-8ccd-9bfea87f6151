@@ -75,6 +75,42 @@ class RollSummary(BaseModel):
     missing_ranges: list[list[int]]
 
 
+class FrameBatchRef(BaseModel):
+    batch_id: str = Field(
+        ..., description="扫到该帧的有效批次；列表按批次原导入顺序排列"
+    )
+    occurrence_count: int | None = Field(
+        ...,
+        description="该帧在该批**原始帧列表**中的出现次数；"
+        "旧批次没有原始列表时为 null（无法区分重复次数，不做推断）",
+    )
+
+
+class FrameProvenanceItem(BaseModel):
+    frame_no: int
+    first_scan_batch_id: str = Field(
+        ...,
+        description="最早有效批次（当前帧归属批次）；撤销批次后按剩余批次实时重算，首扫归属随之转移",
+    )
+    in_expected_coverage: bool = Field(
+        ..., description="该帧是否位于胶卷当前预期覆盖（合并后的预期闭区间）内"
+    )
+    batches: list[FrameBatchRef] = Field(
+        ..., description="扫描过该帧的全部有效批次，按批次原导入顺序排列"
+    )
+
+
+class FrameProvenanceOut(BaseModel):
+    roll_no: str
+    frames: list[FrameProvenanceItem] = Field(
+        ..., description="本页帧的溯源信息，按帧号升序（只含实际存在的帧号）"
+    )
+    next_cursor: int | None = Field(
+        ...,
+        description="下一页游标（本页末帧号），传入 cursor 续读；无后续帧时为 null",
+    )
+
+
 class HealthOut(BaseModel):
     status: str
     db: str

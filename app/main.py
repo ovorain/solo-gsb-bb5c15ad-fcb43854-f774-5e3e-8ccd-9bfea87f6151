@@ -5,7 +5,7 @@ import os
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from sqlite3 import Connection
 
 from . import database, schemas, services
@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="胶片档案扫描整理 API",
     description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比。",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -103,6 +103,42 @@ def get_roll(roll_no: str, conn: Connection = Depends(database.get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
     return result
+
+
+@app.get(
+    "/rolls/{roll_no}/frame-provenance",
+    response_model=schemas.FrameProvenanceOut,
+    tags=["胶卷"],
+)
+def get_frame_provenance(
+    roll_no: str,
+    start: int = Query(..., ge=0, description="帧号区间起始（含），非负整数"),
+    end: int = Query(..., ge=0, description="帧号区间结束（含），非负整数，end ≥ start"),
+    limit: int = Query(..., ge=1, description="每页最多返回的帧数（正整数）"),
+    cursor: int | None = Query(
+        None, ge=0, description="游标：上一页末帧号；续页只取帧号更大的帧"
+    ),
+    conn: Connection = Depends(database.get_db),
+):
+    """胶卷帧号扫描溯源：追查区间内每个实际存在的帧由哪些批次扫描。
+
+    只按**实际存在的帧号**升序键集分页（不逐帧遍历区间跨度），每页最多
+    ``limit`` 帧，``next_cursor`` 为下一页游标（上一页末帧号）。每帧返回：
+    最早有效批次（首扫归属）、按批次**原导入顺序**排列的参与批次及各批
+    **原始列表中的出现次数**（旧批次无原始列表时为 ``null``，不推断），
+    以及该帧是否位于当前预期覆盖内。撤销批次后按剩余批次实时重算，
+    首扫归属随之转移。参数无效（含 end < start）返回 422，胶卷不存在返回 404。
+    """
+    if end < start:
+        raise HTTPException(status_code=422, detail="end 不能小于 start")
+    try:
+        return services.frame_provenance(
+            conn, roll_no.strip(), start, end, limit, cursor
+        )
+    except services.RollNotFoundError:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+    except services.ProvenanceRangeError:
+        raise HTTPException(status_code=422, detail="end 不能小于 start")
 
 
 @app.post(
